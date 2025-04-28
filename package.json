@@ -1,0 +1,19 @@
+{
+  "name": "serverq",
+  "version": "1.0.0",
+  "description": "ini adalah server webhooks",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "adi",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.8.4",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.2.0",
+    "socket.io": "^4.8.1",
+    "twilio": "^5.5.0"
+  }
+}
