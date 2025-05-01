@@ -3,259 +3,479 @@ const bodyParser = require('body-parser');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const axios = require('axios');
+const admin = require('firebase-admin');
+const multer = require('multer');
+const fs = require('fs');
+const FormData = require('form-data');
+
+// Configure multer for file uploads
+const upload = multer({ dest: 'uploads/' });
+
 // Parse application/x-www-form-urlencoded
 app.use(bodyParser.urlencoded({ extended: false }));
 // Parse application/json
 app.use(bodyParser.json());
-const admin = require('firebase-admin');
-// Konfigurasi WhatsApp Business Accounts (tambahkan lebih banyak sesuai kebutuhan)
+
+// Konfigurasi WhatsApp Business Accounts
 const WA_CONFIGS = {
-  'WA_BUSINESS_ID': {
-    phone_number_id: 'WA_BUSINESS_ID', // Ganti dengan PHONE_NUMBER_ID Anda
-    display_phone_number:'62....',
-    access_token: 'ACCESS_TOKEN', // Ganti dengan ACCESS_TOKEN Anda
-  },
+  
 };
+
 const VERIFY_TOKEN = 'omni_channel_testing_bwang';
+
+// Initialize Firebase
 admin.initializeApp({
-  credential: admin.credential.cert(require('./waktoo-crm-7505d-firebase-adminsdk-fbsvc-0c93e91780.json')),
+  credential: admin.credential.cert(require('./waktoo-crm-7505d-firebase-adminsdk-fbsvc-8e2dff4dba.json')),
 });
 
 // Akses Firestore
 const db = admin.firestore();
-// Endpoint untuk webhook
+
+// Webhook verifikasi
 app.get('/webhook', (req, res) => {
-  // Mode dan token untuk verifikasi dari Meta
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  // Cek mode dan token yang dikirim
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    // Respond dengan challenge untuk memverifikasi webhook
     console.log('WEBHOOK_VERIFIED');
     res.status(200).send(challenge);
   } else {
-    // Respond dengan '403 Forbidden' jika token verifikasi tidak cocok
     res.sendStatus(403);
   }
 });
 
-
-// Handle pesan masuk dari WA
-app.post("/webhook", async (req, res) => {
+// Webhook untuk pesan masuk dan status
+app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
     console.log('Webhook received:', JSON.stringify(body, null, 2));
 
-    if (!body.object || !body.entry?.[0]?.changes?.[0]?.value?.messages) {
+    if (!body.object || !body.entry?.[0]?.changes?.[0]?.value) {
       return res.sendStatus(400);
     }
+
     const value = body.entry[0].changes[0].value;
     const phoneNumberId = value.metadata.phone_number_id;
-    const waBusinessId = Object.keys(WA_CONFIGS).find((id) => WA_CONFIGS[id].phone_number_id === phoneNumberId);
-    const messages = value.messages;
-    const metadata = value.metadata;
-    const contact = value.contacts?.[0];
-    for (const message of messages) {
-      await handleIncomingMessage(waBusinessId, message, metadata, contact);
+    const config = await getWaConfig(phoneNumberId);
+
+    if (!config) {
+      console.error(`No WA config found for phone_number_id: ${phoneNumberId}`);
+      return res.sendStatus(400);
     }
+    
+    const waBusinessId = phoneNumberId; // karena ID = phone_number_id
+
+    if (value.messages) {
+      const messages = value.messages;
+      const metadata = value.metadata;
+      const contact = value.contacts?.[0];
+      for (const message of messages) {
+        await handleIncomingMessage( config , message, metadata, contact);
+      }
+    } else if (value.statuses) {
+      const statuses = value.statuses;
+      for (const status of statuses) {
+        await handleMessageStatus(waBusinessId, status);
+      }
+    }
+
     res.sendStatus(200);
   } catch (error) {
     console.error('Error processing webhook:', error);
     res.sendStatus(500);
   }
-  // const body = req.body;
-  // console.log("Webhook received:", JSON.stringify(body, null, 2));
-  // if (body.object) {
-  //   const entry = body.entry?.[0];
-  //   const changes = entry?.changes?.[0];
-  //   const value = changes?.value;
-
-  //   if (value?.messages) {
-  //     const message = value.messages[0];
-  //     const from = message.from;
-  //     const text = message.text?.body;
-
-  //     console.log(`Pesan dari ${from}: ${text}`);
-  //   }
-
-  //   res.sendStatus(200);
-  // } else {
-  //   res.sendStatus(404);
-  // }
 });
 
-// Endpoint untuk mengirim pesan (testing)
+// Endpoint untuk mengirim pesan teks
 app.post('/send-message', async (req, res) => {
   try {
     const { waBusinessId, recipientNumber, messageText, contactName } = req.body;
     if (!waBusinessId || !recipientNumber || !messageText) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    const result = await sendMessage(waBusinessId, recipientNumber, messageText, contactName);
+    const result = await sendTextMessage(waBusinessId, recipientNumber, messageText, contactName);
     res.status(200).json({ success: true, data: result });
   } catch (error) {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-
-// Tangani pesan masuk dari webhook dan simpan ke Firebase
-async function handleIncomingMessage(waBusinessId, message, metadata = {}, contact = {}) {
-  const from = message.from;
-  const text = message.text?.body;
-  if (!from || !text || !WA_CONFIGS[waBusinessId]) return;
-
-  const timestamp = admin.firestore.FieldValue.serverTimestamp();
-  const threadCollection = db.collection('wa_thread_test');
-  const chatCollection = db.collection('wa_chat_test');
-  const contactWaId = contact.wa_id;
-
-  const existingThreadQuery = await threadCollection
-    .where('wa_business_id', '==', waBusinessId)
-    .where('contact_wa_id', '==', contactWaId)
-    .limit(1)
-    .get();
-
-  let threadId;
-  if (!existingThreadQuery.empty) {
-    const threadDoc = existingThreadQuery.docs[0];
-    const threadData = threadDoc.data();
-    if (threadData.status !== 2) {
-      await threadDoc.ref.update({
-        last_message: text,
-        last_updated: timestamp,
-      });
-      threadId = threadDoc.id;
-    } else {
-      const newThreadRef = await threadCollection.add({
-        wa_business_id: waBusinessId,
-        display_phone_number: metadata.display_phone_number,
-        contact_name: contact?.profile?.name || 'Unknown',
-        contact_wa_id: contactWaId,
-        last_message: text,
-        last_updated: timestamp,
-        status: 0,
-      });
-      threadId = newThreadRef.id;
-    }
-  } else {
-    const newThreadRef = await threadCollection.add({
-      wa_business_id: waBusinessId,
-      display_phone_number: metadata.display_phone_number,
-      contact_name: contact?.profile?.name || 'Unknown',
-      contact_wa_id: contactWaId,
-      last_message: text,
-      last_updated: timestamp,
-      status: 0,
-    });
-    threadId = newThreadRef.id;
-  }
-
-  // Buat dokumen chat baru dengan ID otomatis
-  const newChatDocRef = chatCollection.doc();
-  await newChatDocRef.set({
-    id: newChatDocRef.id,
-    thread: threadId,
-    sender: contactWaId,
-    message: text,
-    created_at: timestamp,
-    unread: true,
-  });
-
-  console.log(`Incoming message saved for thread ${threadId} with chat ID ${newChatDocRef.id}`);
-}
-
-
-// Fungsi untuk mengirim notifikasi
-
-// Kirim pesan WhatsApp dan simpan ke Firebase
-async function sendMessage(waBusinessId, recipientNumber, messageText, contactName = 'Unknown') {
+// Endpoint untuk mengupload dan mengirim media
+app.post('/upload-media', upload.single('media'), async (req, res) => {
   try {
+    const { waBusinessId, recipientNumber, mediaType, contactName, caption } = req.body;
+    const mediaFile = req.file;
+
+    if (!waBusinessId || !recipientNumber || !mediaType || !mediaFile) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
     const config = WA_CONFIGS[waBusinessId];
-    if (!config) throw new Error(`Invalid WA Business ID: ${waBusinessId}`);
-    // Kirim pesan via WhatsApp API
-    const response = await axios.post(
-      `https://graph.facebook.com/v20.0/${config.phone_number_id}/messages`,
+    if (!config) {
+      return res.status(400).json({ error: `Invalid WA Business ID: ${waBusinessId}` });
+    }
+
+    // Upload media ke Meta
+    const form = new FormData();
+    form.append('file', fs.createReadStream(mediaFile.path));
+    form.append('type', "image/jpeg"); // bisa disesuaikan dengan file.mimetype kalau dinamis
+    form.append('messaging_product', 'whatsapp');
+
+    const uploadResponse = await axios.post(
+      `https://graph.facebook.com/v22.0/${config.phone_number_id}/media`,
+      form,
       {
-        messaging_product: 'whatsapp',
-        to: recipientNumber,
-        text: { body: messageText },
+        headers: {
+          Authorization: `Bearer ${config.access_token}`,
+          ...form.getHeaders(),
+        },
+      }
+    );
+
+    const mediaId = uploadResponse.data.id;
+    if (!mediaId) {
+      throw new Error('No media ID returned');
+    }
+
+    // Kirim pesan media ke WhatsApp
+    const mediaPayload = {
+      messaging_product: 'whatsapp',
+      to: recipientNumber,
+      type: mediaType,
+      [mediaType]: {
+        id: mediaId,
+        ...(caption ? { caption } : {}), // tambahkan caption jika ada
       },
+    };
+
+    const sendResponse = await axios.post(
+      `https://graph.facebook.com/v20.0/${config.phone_number_id}/messages`,
+      mediaPayload,
       {
         headers: {
           Authorization: `Bearer ${config.access_token}`,
         },
       }
     );
-    //disini harus ada pengecekan berhasil atau tidaknya kirim ke wa api
-    
 
-    // Simpan ke Firebase
-    const timestamp = admin.firestore.FieldValue.serverTimestamp();
-    const threadCollection = db.collection('wa_thread_test');
-    const chatCollection = db.collection('wa_chat_test');
-
-    const existingThreadQuery = await threadCollection
-      .where('wa_business_id', '==', waBusinessId)
-      .where('contact_wa_id', '==', recipientNumber)
-      .limit(1)
-      .get();
-
-    let threadId;
-
-    if (!existingThreadQuery.empty) {
-      const threadDoc = existingThreadQuery.docs[0];
-      const threadData = threadDoc.data();
-
-      if (threadData.status !== 2) {
-        await threadDoc.ref.update({
-          last_message: messageText,
-          last_updated: timestamp,
-        });
-        threadId = threadDoc.id;
-      } else {
-        const newThreadRef = await threadCollection.add({
-          wa_business_id: waBusinessId,
-          display_phone_number: config.display_phone_number, // pakai dari config
-          contact_name: contactName,
-          contact_wa_id: recipientNumber,
-          last_message: messageText,
-          last_updated: timestamp,
-          status: 0,
-        });
-        threadId = newThreadRef.id;
-      }
-    } else {
-      const newThreadRef = await threadCollection.add({
-        wa_business_id: waBusinessId,
-        display_phone_number: config.display_phone_number, // fallback
-        contact_name: contactName,
-        contact_wa_id: recipientNumber,
-        last_message: messageText,
-        last_updated: timestamp,
-        status: 0,
-      });
-      threadId = newThreadRef.id;
+    const wamid = sendResponse.data.messages?.[0]?.id;
+    if (!wamid) {
+      throw new Error('No message ID returned');
     }
-    const newChatDocRef = chatCollection.doc();
+
+    // Simpan ke Firestore
+    const threadId = await getOrCreateThread(
+      waBusinessId,
+      recipientNumber,
+      contactName || 'Unknown',
+      caption ? caption : `Media: ${mediaType}`
+    );
+
+    const newChatDocRef = db.collection('wa_chat_test').doc();
     await newChatDocRef.set({
       id: newChatDocRef.id,
       thread: threadId,
       sender: config.display_phone_number,
-      message: messageText,
-      created_at: timestamp,
-      unread: false, // karena ini pesan dari kita
+      message: caption || '',
+      media_id: mediaId,
+      media_type: mediaType,
+      wamid: wamid,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      unread: false,
     });
 
-    
-    console.log(`Message sent and saved for thread ${threadId}`);
-    return response.data;
+    fs.unlinkSync(mediaFile.path); // hapus file setelah upload
+
+    res.status(200).json({ success: true, wamid });
   } catch (error) {
-    console.error('Error sending message:', error.message);
+    if (req.file) fs.unlinkSync(req.file.path);
+    console.error('Error in upload-media:', error.message);
+    res.status(500).json({ error: 'Failed to send media' });
+  }
+});
+
+
+// Endpoint untuk mendapatkan URL media sementara
+app.get('/media/:mediaId', async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { waBusinessId } = req.query;
+
+    if (!waBusinessId) {
+      return res.status(400).json({ error: 'waBusinessId is required' });
+    }
+
+    const config = await getWaConfig(waBusinessId);
+    if (!config) {
+      return res.status(400).json({ error: 'Invalid WA Business ID' });
+    }
+
+    // Get the media metadata from Graph API (to get actual URL)
+    const mediaResponse = await axios.get(
+      `https://graph.facebook.com/v20.0/${mediaId}`,
+      {
+        headers: { Authorization: `Bearer ${config.access_token}` },
+      }
+    );
+
+    
+    const fileUrl = mediaResponse.data.url;
+    if (!fileUrl) {
+      return res.status(404).json({ error: 'Media URL not found or expired' } );
+    }
+
+    // Use GET request instead of HEAD to get mime-type (HEAD may fail)
+    const fileResponse = await axios.get(fileUrl, {
+      headers: {Authorization: `Bearer ${config.access_token}`},
+      responseType: 'stream',
+    });
+
+    const mimeType = fileResponse.headers['content-type'];
+
+    const proxiedUrl = `${req.protocol}://${req.get('host')}/media-proxy/${mediaId}?waBusinessId=${waBusinessId}`;
+
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json({
+      url: proxiedUrl,
+      mime_type: mimeType,
+    });
+  } catch (error) {
+    console.error('Error fetching media metadata:', error.message);
+    const status = error.response?.status || 500;
+    res.status(status).json({
+      error: error.response?.data?.error?.message || 'Failed to fetch media metadata',
+    });
+  }
+});
+
+
+
+app.get('/media-proxy/:mediaId', async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const { waBusinessId } = req.query;
+
+    if (!waBusinessId) {
+      return res.status(400).json({ error: 'waBusinessId is required' });
+    }
+
+    const config = await getWaConfig(waBusinessId);
+    if (!config) {
+      return res.status(400).json({ error: 'Invalid WA Business ID' });
+    }
+
+    const mediaResponse = await axios.get(
+      `https://graph.facebook.com/v20.0/${mediaId}`,
+      { headers: { Authorization: `Bearer ${config.access_token}` } }
+    );
+
+    const fileUrl = mediaResponse.data.url;
+    if (!fileUrl) {
+      return res.status(404).json({ error: 'Media URL not found or expired' });
+    }
+
+    const fileStream = await axios({
+      method: 'GET',
+      url: fileUrl,
+      responseType: 'stream',
+      headers: {
+        Authorization: `Bearer ${config.access_token}`,
+      },
+    });
+
+    res.setHeader('Content-Type', fileStream.headers['content-type']);
+    res.setHeader('Content-Length', fileStream.headers['content-length']);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // optional cache
+    fileStream.data.pipe(res);
+  } catch (error) {
+    console.error('Error proxying media file:', error.message);
+    const status = error.response?.status || 500;
+    res.status(status).json({ error: error.response?.data?.error?.message || 'Failed to proxy media file' });
+  }
+});
+
+app.post('/wa-configs_test', async (req, res) => {
+  const {
+    phone_number_id,
+    display_phone_number,
+    access_token,
+    participants
+  } = req.body;
+
+  if (!phone_number_id || !display_phone_number || !access_token || !participants) {
+    return res.status(400).json({ error: 'Semua field wajib diisi' });
+  }
+
+  try {
+    const configRef = db.collection('wa_configs').doc(phone_number_id);
+
+    await configRef.set({
+      phone_number_id,
+      display_phone_number,
+      access_token,
+      participants
+    });
+
+    res.status(201).json({ message: 'WA Config berhasil disimpan' });
+  } catch (err) {
+    console.error('Error saat menyimpan WA Config:', err);
+    res.status(500).json({ error: 'Gagal menyimpan WA Config' });
+  }
+});
+
+// Handle pesan masuk
+async function handleIncomingMessage(waConfig, message, metadata = {}, contact = {}) {
+  const from = message.from;
+  const wamid = message.id;
+  const contactWaId = contact.wa_id;
+
+  if (!from || !waConfig) return;
+
+  let text = message.text?.body || '';
+  let mediaId = '';
+  let mediaType = '';
+
+  if (['image', 'video', 'document', 'audio'].includes(message.type)) {
+    mediaType = message.type;
+    mediaId = message[mediaType]?.id || '';
+    text = message[mediaType]?.caption || '';
+    console.log(`Received media: ${mediaType}, ID: ${mediaId}`);
+    console.log(`Received media: ${message}`);
+  }
+
+  const phoneId = waConfig.phone_number_id;
+  const threadId = await getOrCreateThread(phoneId,waConfig, contactWaId, contact?.profile?.name || 'Unknown', text || `Media: ${mediaType}`);
+
+  const newChatDocRef = db.collection('wa_chat_test').doc();
+  await newChatDocRef.set({
+    id: newChatDocRef.id,
+    thread: threadId,
+    sender: contactWaId,
+    message: text,
+    media_id: mediaId,
+    media_type: mediaType,
+    wamid: wamid,
+    created_at: Date.now(),
+    unread: true,
+  });
+
+  console.log(`Saved message for thread ${threadId}, wamid ${wamid}`);
+}
+
+
+// Handle status pesan (read)
+async function handleMessageStatus(waBusinessId, status) {
+  const wamid = status.id;
+  const statusType = status.status;
+  if (statusType === 'read') {
+    const chatQuery = await db.collection('wa_chat_test').where('wamid', '==', wamid).limit(1).get();
+    if (!chatQuery.empty) {
+      await chatQuery.docs[0].ref.update({
+        unread: false,
+        updated_at: Date.now(),
+      });
+      console.log(`Chat wamid ${wamid} marked as read`);
+    }
+  }
+}
+
+// Kirim pesan teks
+async function sendTextMessage(waBusinessId, recipientNumber, messageText, contactName) {
+  const config = await getWaConfig(waBusinessId);
+  if (!config) throw new Error(`Invalid WA Business ID`);
+
+  contactName = contactName || 'Unknown';
+
+  let response;
+  try {
+    response = await axios.post(
+      `https://graph.facebook.com/v20.0/${config.phone_number_id}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        to: recipientNumber,
+        text: { body: messageText },
+      },
+      { headers: { Authorization: `Bearer ${config.access_token}` } }
+    );
+  } catch (error) {
+    console.error('Failed to send message to WhatsApp:', error.response?.data || error.message);
     throw error;
   }
+
+  const wamid = response.data.messages?.[0]?.id;
+  if (!wamid) throw new Error('No message ID returned');
+
+  const threadId = await getOrCreateThread(waBusinessId, config, recipientNumber, contactName, messageText);
+
+  const newChatDocRef = db.collection('wa_chat_test').doc();
+  await newChatDocRef.set({
+    id: newChatDocRef.id,
+    thread: threadId,
+    sender: config.display_phone_number,
+    message: messageText,
+    media_id: '',
+    media_type: '',
+    wamid: wamid,
+    created_at: Date.now(),
+    unread: true,
+  });
+
+  console.log(`Message sent. WAMID: ${wamid}, ThreadID: ${threadId}`);
+
+  return response.data;
+}
+
+// Helper untuk thread
+async function getOrCreateThread(waBusinessId, waConfig, contactWaId, contactName, lastMessage) {
+  const threadCollection = db.collection('wa_thread_test');
+  const timestamp = Date.now();
+
+  // Ambil semua thread yang cocok, lalu filter aktif di client-side
+  const existingThreadQuery = await threadCollection
+    .where('wa_business_id', '==', waBusinessId)
+    .where('contact_wa_id', '==', contactWaId)
+    .get();
+
+  const activeThreadDoc = existingThreadQuery.docs.find(
+    doc => doc.data().status !== 2
+  );
+
+  if (activeThreadDoc) {
+    await activeThreadDoc.ref.update({
+      last_message: lastMessage,
+      last_updated: timestamp
+    });
+    return activeThreadDoc.id;
+  }
+
+  // Jika tidak ada thread aktif, buat baru
+  const newThreadRef = await threadCollection.add({
+    wa_business_id: waBusinessId,
+    display_phone_number: waConfig.display_phone_number,
+    contact_name: contactName,
+    contact_wa_id: contactWaId,
+    last_message: lastMessage,
+    last_updated: timestamp,
+    status: 0, // status aktif
+  });
+
+  return newThreadRef.id;
+}
+
+
+
+async function getWaConfig(phoneNumberId) {
+  const docRef = db.collection('wa_configs').doc(phoneNumberId);
+  const doc = await docRef.get();
+
+  if (!doc.exists) {
+    console.log('No config found for phone_number_id:', phoneNumberId);
+    return null;
+  }
+  
+  // console.log('No config found for phone_number_id:',doc.data());
+  return doc.data(); // bisa juga return { id: doc.id, ...doc.data() } kalau perlu ID-nya juga
 }
 
 
